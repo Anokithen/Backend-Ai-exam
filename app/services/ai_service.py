@@ -194,9 +194,19 @@ def _collect_stream(response) -> str:
 def _download_material(material) -> bytes:
     # Not material.secure_url: Cloudinary refuses plain delivery of raw files, so a PDF's own
     # URL answers 401 and the read failed before it had read anything.
-    url = authenticated_download_url(
-        material.cloudinary_public_id, material.cloudinary_resource_type
-    )
+    try:
+        url = authenticated_download_url(
+            material.cloudinary_public_id, material.cloudinary_resource_type
+        )
+    except Exception as exc:
+        # Signing needs the API secret; without it this raises before any request is made,
+        # and a config problem would otherwise reach the teacher as a blank 500.
+        raise AIServiceError(
+            "The server is missing its Cloudinary settings, so it cannot fetch this file. "
+            "Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET on the "
+            "server and restart it."
+        ) from exc
+
     try:
         response = requests.get(url, timeout=60)
         response.raise_for_status()

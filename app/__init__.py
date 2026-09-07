@@ -72,6 +72,26 @@ def _init_extensions(app):
         api_secret=app.config["CLOUDINARY_API_SECRET"],
         secure=True,
     )
+    # Every material is fetched from Cloudinary with a signed URL, so a missing secret breaks
+    # reading and downloading files while everything else looks healthy. Said once at boot,
+    # where the platform log will show it, rather than only when a teacher hits it.
+    missing = [
+        name
+        for name in ("CLOUDINARY_CLOUD_NAME", "CLOUDINARY_API_KEY", "CLOUDINARY_API_SECRET")
+        if not app.config[name]
+    ]
+    if missing:
+        app.logger.error(
+            "Cloudinary is not configured (%s not set): uploading, reading and downloading "
+            "study materials will all fail until it is.",
+            ", ".join(missing),
+        )
+    else:
+        app.logger.info(
+            "Cloudinary configured: cloud=%s key=...%s",
+            app.config["CLOUDINARY_CLOUD_NAME"],
+            str(app.config["CLOUDINARY_API_KEY"])[-4:],
+        )
 
 
 def register_error_handlers(app):
