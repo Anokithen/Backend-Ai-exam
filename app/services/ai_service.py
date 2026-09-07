@@ -38,6 +38,15 @@ MAX_IMAGE_LONG_SIDE = 1600
 # requests at once to get the whole exam rate limited.
 MAX_CONCURRENT_IMAGE_CALLS = 4
 
+# A PDF page holding this little text is taken to be a scan rather than a page of writing,
+# and is read with the vision model instead. Kept low so a genuinely sparse page - a title
+# page, a section divider - is trusted as-is rather than costing a model call.
+MIN_PAGE_TEXT_CHARS = 20
+
+# Reading a scanned page costs a model round trip, so a long scan is cut off here instead of
+# running for an hour. The teacher is told in the text which pages were left out.
+MAX_OCR_PAGES = 12
+
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 # Languages the fast vision models were measured reading correctly. Everything else prefers
@@ -283,7 +292,7 @@ def extract_material_text(material, language: str = "English") -> str:
     content = _download_material(material)
 
     if material.file_type == MaterialType.PDF:
-        text = _extract_pdf_text(content)
+        text = _extract_pdf_text(content, language)
     else:
         text = _extract_image_text(content, material.mime_type, language)
 
@@ -295,12 +304,100 @@ def extract_material_text(material, language: str = "English") -> str:
     return text
 
 
-def _extract_pdf_text(content: bytes) -> str:
+def _extract_pdf_text(content: bytes, language: str = "English") -> str:
+    """Read a PDF's text, falling back to the vision model for pages that were scanned.
+
+    pypdf only ever returns a text layer, and a scan has none: every page comes back empty and
+    the material was rejected as unreadable, which is the whole of "try a text-based PDF". A
+    scanned page does carry its image, and reading an image of a page is what the vision path
+    already does - so those pages go through it. Mixed files are handled a page at a time, so
+    a typed report with a photographed appendix reads correctly throughout.
+    """
     try:
         reader = PdfReader(io.BytesIO(content))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        pages = list(reader.pages)
     except Exception as exc:
         raise AIServiceError("Failed to read the PDF file.") from exc
+
+    texts = []
+    scanned = []
+    for index, page in enumerate(pages):
+        try:
+            text = (page.extract_text() or "").strip()
+        except Exception:
+            # One malformed page should not cost the whole document.
+            text = ""
+        texts.append(text)
+        if len(text) < MIN_PAGE_TEXT_CHARS:
+            scanned.append(index)
+
+    if not scanned:
+        return "\n".join(texts)
+
+    unread = scanned[MAX_OCR_PAGES:]
+    for index, page_text in _read_scanned_pages(pages, scanned[:MAX_OCR_PAGES], language):
+        texts[index] = page_text
+
+    if unread:
+        # Said in the returned text, which the teacher reviews and edits, so a part-read file
+        # can never look like a complete one.
+        texts.append(
+            f"[{len(unread)} scanned page(s) were not read: at most {MAX_OCR_PAGES} per file. "
+            f"Split the PDF to read the rest.]"
+        )
+
+    return "\n".join(text for text in texts if text)
+
+
+def _read_scanned_pages(pages, indexes, language):
+    """Read the given pages with the vision model, yielding ``(index, text)`` as each finishes."""
+    if not indexes:
+        return
+
+    app = current_app._get_current_object()
+
+    def read(index):
+        # Flask's context is thread-local, so each worker pushes its own.
+        with app.app_context():
+            image = _page_image_bytes(pages[index])
+            if image is None:
+                return index, ""
+            try:
+                return index, _extract_image_text(image, "image/jpeg", language).strip()
+            except AIServiceError:
+                # A page the model cannot read is left empty rather than failing the file;
+                # the length check on the whole document still catches a total failure.
+                current_app.logger.warning("Could not read scanned page %s", index + 1)
+                return index, ""
+
+    with ThreadPoolExecutor(max_workers=min(len(indexes), MAX_CONCURRENT_IMAGE_CALLS)) as pool:
+        futures = [pool.submit(read, index) for index in indexes]
+        for future in as_completed(futures):
+            yield future.result()
+
+
+def _page_image_bytes(page):
+    """The page's scan as JPEG bytes, or None if the page carries no usable image.
+
+    A scanned page is normally a single full-page image; where a scanner has split one into
+    strips, the largest is the one carrying the body text.
+    """
+    try:
+        images = list(page.images)
+    except Exception:
+        return None
+    if not images:
+        return None
+
+    try:
+        image = max(images, key=lambda item: item.image.width * item.image.height).image
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90, optimize=True)
+        return buffer.getvalue()
+    except Exception:
+        return None
 
 
 def _extract_image_text(content: bytes, mime_type: str, language: str = "English") -> str:
