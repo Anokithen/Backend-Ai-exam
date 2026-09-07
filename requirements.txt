@@ -1,5 +1,15 @@
 Flask
 Flask-SQLAlchemy
+Flask-Migrate
 Flask-CORS
+Flask-JWT-Extended
 python-dotenv
 PyMySQL
+bcrypt
+pydantic
+email-validator
+cloudinary
+requests
+pypdf
+Pillow
+reportlab
