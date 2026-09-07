@@ -1,6 +1,8 @@
 import enum
 import uuid
 
+from sqlalchemy.dialects.mysql import LONGTEXT
+
 from app.extensions import db
 from app.models.base import TimestampMixin
 from app.utils.time import iso_utc
@@ -30,7 +32,11 @@ class Material(db.Model, TimestampMixin):
 
     # Extracted once after upload and reused for every exam, so generation never
     # re-runs the slow OCR/vision pass. NULL means "not read yet".
-    extracted_text = db.Column(db.Text, nullable=True)
+    #
+    # LONGTEXT on MySQL, not TEXT: TEXT holds 65,535 bytes and a textbook chapter runs well
+    # past that (a 48-page one came to 77KB), so the read would finish and then fail on the
+    # write with "Data too long for column". Other backends keep plain TEXT, which is unbounded.
+    extracted_text = db.Column(db.Text().with_variant(LONGTEXT, "mysql"), nullable=True)
 
     teacher = db.relationship("User", backref=db.backref("materials", cascade="all, delete-orphan"))
 

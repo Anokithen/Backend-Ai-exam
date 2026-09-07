@@ -14,6 +14,7 @@ def ensure_schema(app):
     _ensure_users_role_enum(app)
     _ensure_materials_cloudinary_columns(app)
     _ensure_materials_extracted_text_column(app)
+    _ensure_materials_extracted_text_is_long(app)
     _ensure_exams_language_column(app)
 
 
@@ -95,6 +96,31 @@ def _ensure_materials_extracted_text_column(app):
         conn.execute(sa.text("ALTER TABLE materials ADD COLUMN extracted_text LONGTEXT NULL"))
 
     app.logger.info("materials table reconciled with extracted_text column")
+
+
+def _ensure_materials_extracted_text_is_long(app):
+    """Widen materials.extracted_text from TEXT to LONGTEXT.
+
+    The ADD COLUMN above already asks for LONGTEXT, but it only runs when the column is
+    missing. A database whose column was built by create_all() from the model got MySQL's
+    TEXT - 65,535 bytes - and create_all() never alters a column afterwards, so reading any
+    material longer than that failed on the final write with "Data too long for column".
+    """
+    if db.engine.dialect.name != "mysql":
+        return
+
+    inspector = sa.inspect(db.engine)
+    if "materials" not in inspector.get_table_names():
+        return
+
+    column = {col["name"]: col for col in inspector.get_columns("materials")}.get("extracted_text")
+    if column is None or str(column["type"]).upper().startswith("LONGTEXT"):
+        return
+
+    with db.engine.begin() as conn:
+        conn.execute(sa.text("ALTER TABLE materials MODIFY COLUMN extracted_text LONGTEXT NULL"))
+
+    app.logger.info("materials.extracted_text widened from %s to LONGTEXT", column["type"])
 
 
 def _ensure_exams_language_column(app):
