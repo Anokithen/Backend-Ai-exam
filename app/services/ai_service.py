@@ -39,26 +39,6 @@ MAX_IMAGE_LONG_SIDE = 1600
 # requests at once to get the whole exam rate limited.
 MAX_CONCURRENT_IMAGE_CALLS = 4
 
-# A PDF page holding this little text is taken to be a scan rather than a page of writing,
-# and is read with the vision model instead. Kept low so a genuinely sparse page - a title
-# page, a section divider - is trusted as-is rather than costing a model call.
-MIN_PAGE_TEXT_CHARS = 20
-
-# OCR runs on this machine, so the limit is cores rather than an API's rate limit.
-MAX_CONCURRENT_OCR_PAGES = 4
-
-# A scan is cut off here rather than reading hundreds of pages on one upload. The teacher is
-# told in the returned text which pages were left out.
-MAX_OCR_PAGES = 40
-
-# Tesseract's code for each language the app offers. A scanned page is read with the matching
-# pack; anything unlisted is read as English.
-TESSERACT_LANGUAGES = {
-    "english": "eng",
-    "sinhala": "sin",
-    "tamil": "tam",
-}
-
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
 # Languages the fast vision models were measured reading correctly. Everything else prefers
@@ -324,13 +304,13 @@ def extract_material_text(material, language: str = "English") -> str:
 
 
 def _extract_pdf_text(content: bytes, language: str = "English") -> str:
-    """Read a PDF's text, falling back to the vision model for pages that were scanned.
+    """Read a PDF's text with pypdf.
 
-    pypdf only ever returns a text layer, and a scan has none: every page comes back empty and
-    the material was rejected as unreadable, which is the whole of "try a text-based PDF". A
-    scanned page does carry its image, and reading an image of a page is what the vision path
-    already does - so those pages go through it. Mixed files are handled a page at a time, so
-    a typed report with a photographed appendix reads correctly throughout.
+    A PDF made from a document carries its text, so pypdf reads it directly: no model call, no
+    cost, and the words come back exactly as they were written rather than as a model's account
+    of them. A PDF made by scanning carries no text at all, only page images - there is nothing
+    for pypdf to find, and the teacher is told to upload those pages as images, which is the
+    path built for reading a picture of a page.
     """
     try:
         reader = PdfReader(io.BytesIO(content))
@@ -339,120 +319,20 @@ def _extract_pdf_text(content: bytes, language: str = "English") -> str:
         raise AIServiceError("Failed to read the PDF file.") from exc
 
     texts = []
-    scanned = []
-    for index, page in enumerate(pages):
+    for page in pages:
         try:
-            text = (page.extract_text() or "").strip()
+            texts.append((page.extract_text() or "").strip())
         except Exception:
             # One malformed page should not cost the whole document.
-            text = ""
-        texts.append(text)
-        if len(text) < MIN_PAGE_TEXT_CHARS:
-            scanned.append(index)
+            texts.append("")
 
-    if not scanned:
-        return "\n".join(texts)
-
-    if not _ocr_available():
-        # A typed document with a near-blank page - a divider, a last page holding a footer -
-        # has "scanned" pages that are nothing of the sort. Only a document that is genuinely
-        # a scan has no text to fall back on, so only that one is worth failing.
-        if sum(len(text) for text in texts) >= MIN_EXTRACTED_CHARS:
-            return "\n".join(text for text in texts if text)
+    text = "\n".join(part for part in texts if part)
+    if len(text) < MIN_EXTRACTED_CHARS:
         raise AIServiceError(
-            "This PDF is a scan - it holds no text, only page images - and the OCR engine is "
-            "not installed on the server, so its pages cannot be read. Install tesseract-ocr "
-            "on the server, or upload the pages as images instead."
+            "There is no text in this PDF to read - it is a scan, a picture of each page. "
+            "Upload the pages as images instead and the AI will read them."
         )
-
-    unread = scanned[MAX_OCR_PAGES:]
-    for index, page_text in _read_scanned_pages(pages, scanned[:MAX_OCR_PAGES], language):
-        texts[index] = page_text
-
-    if unread:
-        # Said in the returned text, which the teacher reviews and edits, so a part-read file
-        # can never look like a complete one.
-        texts.append(
-            f"[{len(unread)} scanned page(s) were not read: at most {MAX_OCR_PAGES} per file. "
-            f"Split the PDF to read the rest.]"
-        )
-
-    return "\n".join(text for text in texts if text)
-
-
-def _read_scanned_pages(pages, indexes, language):
-    """Read the given scanned pages with OCR, yielding ``(index, text)`` as each finishes."""
-    if not indexes:
-        return
-
-    app = current_app._get_current_object()
-
-    def read(index):
-        # Flask's context is thread-local, so each worker pushes its own.
-        with app.app_context():
-            image = _page_image_bytes(pages[index])
-            if image is None:
-                return index, ""
-            try:
-                return index, _ocr_page(image, language).strip()
-            except Exception:
-                # A page OCR cannot read is left empty rather than failing the file; the
-                # length check on the whole document still catches a total failure.
-                current_app.logger.warning("Could not read scanned page %s", index + 1)
-                return index, ""
-
-    with ThreadPoolExecutor(max_workers=min(len(indexes), MAX_CONCURRENT_OCR_PAGES)) as pool:
-        futures = [pool.submit(read, index) for index in indexes]
-        for future in as_completed(futures):
-            yield future.result()
-
-
-def _ocr_page(content: bytes, language: str) -> str:
-    """Read one scanned page with Tesseract.
-
-    A PDF page is a scan of a document, which is what an OCR engine is built for: it runs
-    locally, costs nothing per page and returns what is on the page rather than a model's
-    account of it. The vision model stays where it is actually needed - a photograph uploaded
-    as an image, where there is no document structure to work from.
-    """
-    import pytesseract
-
-    code = TESSERACT_LANGUAGES.get((language or "").strip().casefold(), "eng")
-    return pytesseract.image_to_string(Image.open(io.BytesIO(content)), lang=code)
-
-
-def _ocr_available() -> bool:
-    try:
-        import pytesseract
-
-        pytesseract.get_tesseract_version()
-        return True
-    except Exception:
-        return False
-
-
-def _page_image_bytes(page):
-    """The page's scan as JPEG bytes, or None if the page carries no usable image.
-
-    A scanned page is normally a single full-page image; where a scanner has split one into
-    strips, the largest is the one carrying the body text.
-    """
-    try:
-        images = list(page.images)
-    except Exception:
-        return None
-    if not images:
-        return None
-
-    try:
-        image = max(images, key=lambda item: item.image.width * item.image.height).image
-        if image.mode not in ("RGB", "L"):
-            image = image.convert("RGB")
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=90, optimize=True)
-        return buffer.getvalue()
-    except Exception:
-        return None
+    return text
 
 
 def _extract_image_text(content: bytes, mime_type: str, language: str = "English") -> str:

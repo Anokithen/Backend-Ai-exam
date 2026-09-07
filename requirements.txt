@@ -14,4 +14,3 @@ pypdf
 Pillow
 reportlab
 gunicorn
-pytesseract
