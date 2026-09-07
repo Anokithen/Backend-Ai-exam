@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import timedelta
 from urllib.parse import quote_plus
 
@@ -25,6 +26,28 @@ def _database_uri(username, password, host, port, database):
         f"mysql+pymysql://{quote_plus(username)}:{quote_plus(password)}"
         f"@{host}:{port}/{database}"
     )
+
+
+def _cors_origins():
+    """Origins allowed to call the API, as exact strings or compiled patterns.
+
+    Two things bite here. A trailing slash never matches, because the browser's Origin
+    header has none - so it is stripped rather than silently failing. And Vercel gives every
+    preview deployment its own hostname, which no fixed list can cover, so a `*` in an entry
+    is treated as a wildcard: `https://my-app-*.vercel.app` admits them all.
+    """
+    raw = os.environ.get("CORS_ORIGINS", "http://localhost:3000")
+    origins = []
+    for entry in raw.split(","):
+        entry = entry.strip().rstrip("/")
+        if not entry:
+            continue
+        if "*" in entry:
+            pattern = ".*".join(re.escape(part) for part in entry.split("*"))
+            origins.append(re.compile(f"^{pattern}$"))
+        else:
+            origins.append(entry)
+    return origins
 
 
 class Config:
@@ -62,11 +85,7 @@ class Config:
     JWT_ERROR_MESSAGE_KEY = "message"
 
     # --- CORS ---
-    CORS_ORIGINS = [
-        origin.strip()
-        for origin in os.environ.get("CORS_ORIGINS", "http://localhost:3000").split(",")
-        if origin.strip()
-    ]
+    CORS_ORIGINS = _cors_origins()
 
     # --- NVIDIA NIM ---
     NVIDIA_NIM_API_KEY = os.environ.get("NVIDIA_NIM_API_KEY", "")

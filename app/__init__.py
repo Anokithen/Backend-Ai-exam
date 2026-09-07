@@ -1,3 +1,5 @@
+import logging
+
 from flask import Flask
 
 from app.config import Config
@@ -10,6 +12,7 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
+    _configure_logging(app)
     _init_extensions(app)
 
     with app.app_context():
@@ -35,11 +38,30 @@ def create_app():
     return app
 
 
+def _configure_logging(app):
+    """Route Flask's logs through gunicorn's handlers.
+
+    Without this the app logger keeps its own defaults under gunicorn and everything below
+    WARNING - including the startup lines and the 500 handler's traceback - never reaches
+    the platform log stream, which is the only view of a deployed service.
+    """
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    if gunicorn_logger.handlers:
+        app.logger.handlers = gunicorn_logger.handlers
+        app.logger.setLevel(gunicorn_logger.level)
+
+
 def _init_extensions(app):
     import cloudinary
     from flask_cors import CORS
 
     CORS(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}}, supports_credentials=True)
+    # A browser only reports "blocked by CORS policy" on its own side, so state the allowed
+    # set here - it is the one place a deployed service can show what it will accept.
+    app.logger.info(
+        "CORS allows: %s",
+        ", ".join(o.pattern if hasattr(o, "pattern") else o for o in app.config["CORS_ORIGINS"]),
+    )
     db.init_app(app)
     migrate.init_app(app, db)
     jwt.init_app(app)
