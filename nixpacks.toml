@@ -1,0 +1,5 @@
+# Tesseract is a system package, so Nixpacks has to be told to install it: a scanned PDF is
+# read with OCR rather than sent to the vision model. The language packs match the languages
+# the app offers - drop any you do not need, each one is a download at build time.
+[phases.setup]
+aptPkgs = ["...", "tesseract-ocr", "tesseract-ocr-sin", "tesseract-ocr-tam"]

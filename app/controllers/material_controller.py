@@ -1,4 +1,3 @@
-import cloudinary.utils
 from flask import current_app, redirect, request
 from flask_jwt_extended import get_current_user
 from werkzeug.utils import secure_filename
@@ -10,6 +9,7 @@ from app.services.ai_service import extract_material_text as ai_extract_material
 from app.services.material_service import (
     MaterialServiceError,
     UnsupportedFileType,
+    authenticated_download_url,
     build_upload_signature,
     delete_material_file,
     resolve_file_type,
@@ -147,12 +147,9 @@ def download_material(public_id):
         return error_response("Material not found.", code="NOT_FOUND", status=404)
 
     base_name = secure_filename(material.original_filename.rsplit(".", 1)[0]) or "download"
-    url, _ = cloudinary.utils.cloudinary_url(
-        material.cloudinary_public_id,
-        resource_type=material.cloudinary_resource_type,
-        type="upload",
-        secure=True,
-        flags=f"attachment:{base_name}",
+    # An ordinary delivery URL is refused for raw files (PDFs), so this is authenticated too.
+    url = authenticated_download_url(
+        material.cloudinary_public_id, material.cloudinary_resource_type, attachment=base_name
     )
     return redirect(url)
 

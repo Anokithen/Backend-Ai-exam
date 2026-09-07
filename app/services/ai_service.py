@@ -11,6 +11,7 @@ from PIL import Image
 from pypdf import PdfReader
 
 from app.models.material_model import MaterialType
+from app.services.material_service import authenticated_download_url
 
 MIN_EXTRACTED_CHARS = 40
 
@@ -43,9 +44,20 @@ MAX_CONCURRENT_IMAGE_CALLS = 4
 # page, a section divider - is trusted as-is rather than costing a model call.
 MIN_PAGE_TEXT_CHARS = 20
 
-# Reading a scanned page costs a model round trip, so a long scan is cut off here instead of
-# running for an hour. The teacher is told in the text which pages were left out.
-MAX_OCR_PAGES = 12
+# OCR runs on this machine, so the limit is cores rather than an API's rate limit.
+MAX_CONCURRENT_OCR_PAGES = 4
+
+# A scan is cut off here rather than reading hundreds of pages on one upload. The teacher is
+# told in the returned text which pages were left out.
+MAX_OCR_PAGES = 40
+
+# Tesseract's code for each language the app offers. A scanned page is read with the matching
+# pack; anything unlisted is read as English.
+TESSERACT_LANGUAGES = {
+    "english": "eng",
+    "sinhala": "sin",
+    "tamil": "tam",
+}
 
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
@@ -200,14 +212,21 @@ def _collect_stream(response) -> str:
 
 
 def _download_material(material) -> bytes:
+    # Not material.secure_url: Cloudinary refuses plain delivery of raw files, so a PDF's own
+    # URL answers 401 and the read failed before it had read anything.
+    url = authenticated_download_url(
+        material.cloudinary_public_id, material.cloudinary_resource_type
+    )
     try:
-        response = requests.get(material.secure_url, timeout=30)
+        response = requests.get(url, timeout=60)
         response.raise_for_status()
     except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 401:
+        status = exc.response.status_code if exc.response is not None else None
+        if status in (401, 403):
             raise AIServiceError(
-                "Cloudinary is blocking delivery of this file. In the Cloudinary console, go to "
-                "Settings → Security and enable delivery of PDF/raw files, then try again."
+                "Cloudinary refused to deliver this file even for an authenticated download. "
+                "Check that the API key and secret in the server's settings belong to the "
+                "same Cloudinary account the file was uploaded to."
             ) from exc
         raise AIServiceError("Failed to download the material file.") from exc
     except requests.RequestException as exc:
@@ -334,6 +353,18 @@ def _extract_pdf_text(content: bytes, language: str = "English") -> str:
     if not scanned:
         return "\n".join(texts)
 
+    if not _ocr_available():
+        # A typed document with a near-blank page - a divider, a last page holding a footer -
+        # has "scanned" pages that are nothing of the sort. Only a document that is genuinely
+        # a scan has no text to fall back on, so only that one is worth failing.
+        if sum(len(text) for text in texts) >= MIN_EXTRACTED_CHARS:
+            return "\n".join(text for text in texts if text)
+        raise AIServiceError(
+            "This PDF is a scan - it holds no text, only page images - and the OCR engine is "
+            "not installed on the server, so its pages cannot be read. Install tesseract-ocr "
+            "on the server, or upload the pages as images instead."
+        )
+
     unread = scanned[MAX_OCR_PAGES:]
     for index, page_text in _read_scanned_pages(pages, scanned[:MAX_OCR_PAGES], language):
         texts[index] = page_text
@@ -350,7 +381,7 @@ def _extract_pdf_text(content: bytes, language: str = "English") -> str:
 
 
 def _read_scanned_pages(pages, indexes, language):
-    """Read the given pages with the vision model, yielding ``(index, text)`` as each finishes."""
+    """Read the given scanned pages with OCR, yielding ``(index, text)`` as each finishes."""
     if not indexes:
         return
 
@@ -363,17 +394,41 @@ def _read_scanned_pages(pages, indexes, language):
             if image is None:
                 return index, ""
             try:
-                return index, _extract_image_text(image, "image/jpeg", language).strip()
-            except AIServiceError:
-                # A page the model cannot read is left empty rather than failing the file;
-                # the length check on the whole document still catches a total failure.
+                return index, _ocr_page(image, language).strip()
+            except Exception:
+                # A page OCR cannot read is left empty rather than failing the file; the
+                # length check on the whole document still catches a total failure.
                 current_app.logger.warning("Could not read scanned page %s", index + 1)
                 return index, ""
 
-    with ThreadPoolExecutor(max_workers=min(len(indexes), MAX_CONCURRENT_IMAGE_CALLS)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(indexes), MAX_CONCURRENT_OCR_PAGES)) as pool:
         futures = [pool.submit(read, index) for index in indexes]
         for future in as_completed(futures):
             yield future.result()
+
+
+def _ocr_page(content: bytes, language: str) -> str:
+    """Read one scanned page with Tesseract.
+
+    A PDF page is a scan of a document, which is what an OCR engine is built for: it runs
+    locally, costs nothing per page and returns what is on the page rather than a model's
+    account of it. The vision model stays where it is actually needed - a photograph uploaded
+    as an image, where there is no document structure to work from.
+    """
+    import pytesseract
+
+    code = TESSERACT_LANGUAGES.get((language or "").strip().casefold(), "eng")
+    return pytesseract.image_to_string(Image.open(io.BytesIO(content)), lang=code)
+
+
+def _ocr_available() -> bool:
+    try:
+        import pytesseract
+
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
 
 
 def _page_image_bytes(page):
