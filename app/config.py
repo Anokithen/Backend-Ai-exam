@@ -1,9 +1,30 @@
 import os
 from datetime import timedelta
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+def _database_uri(username, password, host, port, database):
+    """Build the SQLAlchemy URL, preferring a full URL when the platform supplies one.
+
+    Railway's MySQL service exposes MYSQL_URL/DATABASE_URL rather than the five separate
+    settings, and writes it with a bare "mysql://" scheme that SQLAlchemy cannot resolve to
+    a driver on its own. The credentials are percent-encoded because a generated password
+    routinely contains characters that would otherwise end the URL early.
+    """
+    url = os.environ.get("DATABASE_URL") or os.environ.get("MYSQL_URL") or ""
+    if url:
+        if url.startswith("mysql://"):
+            url = "mysql+pymysql://" + url[len("mysql://") :]
+        return url
+
+    return (
+        f"mysql+pymysql://{quote_plus(username)}:{quote_plus(password)}"
+        f"@{host}:{port}/{database}"
+    )
 
 
 class Config:
@@ -16,14 +37,17 @@ class Config:
     MYSQL_USERNAME = os.environ.get("MYSQL_USERNAME", "root")
     MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
 
-    SQLALCHEMY_DATABASE_URI = (
-        f"mysql+pymysql://{MYSQL_USERNAME}:{MYSQL_PASSWORD}"
-        f"@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
+    SQLALCHEMY_DATABASE_URI = _database_uri(
+        MYSQL_USERNAME, MYSQL_PASSWORD, MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE
     )
     SQLALCHEMY_TRACK_MODIFICATIONS = False
     SQLALCHEMY_ENGINE_OPTIONS = {
         "pool_pre_ping": True,
         "pool_recycle": 280,
+        # Sized against gunicorn.conf.py: each worker process gets its own pool, so the
+        # ceiling on the database is workers x (pool_size + max_overflow).
+        "pool_size": int(os.environ.get("DB_POOL_SIZE", 5)),
+        "max_overflow": int(os.environ.get("DB_MAX_OVERFLOW", 5)),
     }
 
     # --- JWT ---

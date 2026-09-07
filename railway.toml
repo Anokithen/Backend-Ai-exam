@@ -1,0 +1,11 @@
+# The start command lives in the Procfile so it is not duplicated here.
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+# Flask serves this without auth; Railway holds the new deployment until it answers.
+healthcheckPath = "/health"
+healthcheckTimeout = 100
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
