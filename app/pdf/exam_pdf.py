@@ -15,20 +15,62 @@ from app.models.exam_model import QuestionType
 
 _LETTERS = string.ascii_uppercase
 
-# NotoSansTamil only has Tamil-script glyphs (no Latin), so mixed Tamil+English
+# The Tamil font only has Tamil-script glyphs (no Latin), so mixed Tamil+English
 # text (marks, numbers, English terms) needs per-run font switching rather than
 # a single font for the whole document — ReportLab has no automatic font fallback.
 _FONT_DIR = os.path.join(os.path.dirname(__file__), "fonts")
-_FONT_TAMIL = "NotoSansTamil"
-_FONT_TAMIL_BOLD = "NotoSansTamil-Bold"
-_TAMIL_RUN = re.compile(r"[஀-௿]+")
+_FONT_TAMIL = "TamilScript"
+_FONT_TAMIL_BOLD = "TamilScript-Bold"
+_TAMIL_RUN = re.compile(r"[\u0b80-\u0bff]+")
+
+# Preferred first: Latha (Microsoft's Tamil UI font). It is not redistributable,
+# so it is only used when someone drops latha.ttf / lathab.ttf into fonts/ (or it
+# is installed system-wide); otherwise we fall back to the bundled Noto Sans Tamil.
+_TAMIL_FACES = (
+    ("latha.ttf", "lathab.ttf"),
+    ("NotoSansTamil-Regular.ttf", "NotoSansTamil-Bold.ttf"),
+)
+_FONT_SEARCH_DIRS = (
+    _FONT_DIR,
+    "/usr/share/fonts/truetype/msttcorefonts",
+    "/usr/share/fonts/truetype/tamil",
+    "/usr/local/share/fonts",
+    os.path.expanduser("~/.fonts"),
+    "C:\\Windows\\Fonts",
+)
+
+
+def _find_font_file(filename: str):
+    """Locate a font file case-insensitively across the known font directories."""
+    target = filename.lower()
+    for directory in _FONT_SEARCH_DIRS:
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.lower() == target:
+                return os.path.join(directory, entry)
+    return None
+
+
+def _resolve_tamil_faces():
+    """Return (regular_path, bold_path) for the first available Tamil face."""
+    for regular, bold in _TAMIL_FACES:
+        regular_path = _find_font_file(regular)
+        if not regular_path:
+            continue
+        # Latha ships without a separate bold on some systems; reuse the regular.
+        return regular_path, _find_font_file(bold) or regular_path
+    raise FileNotFoundError("No Tamil font found; expected latha.ttf or NotoSansTamil-Regular.ttf")
 
 
 def _register_fonts():
     if _FONT_TAMIL in pdfmetrics.getRegisteredFontNames():
         return
-    pdfmetrics.registerFont(TTFont(_FONT_TAMIL, os.path.join(_FONT_DIR, "NotoSansTamil-Regular.ttf")))
-    pdfmetrics.registerFont(TTFont(_FONT_TAMIL_BOLD, os.path.join(_FONT_DIR, "NotoSansTamil-Bold.ttf")))
+    regular_path, bold_path = _resolve_tamil_faces()
+    pdfmetrics.registerFont(TTFont(_FONT_TAMIL, regular_path))
+    pdfmetrics.registerFont(TTFont(_FONT_TAMIL_BOLD, bold_path))
     pdfmetrics.registerFontFamily(
         _FONT_TAMIL,
         normal=_FONT_TAMIL,
