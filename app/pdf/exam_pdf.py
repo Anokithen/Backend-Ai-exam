@@ -27,11 +27,18 @@ _TAMIL_RUN = re.compile(r"[\u0b80-\u0bff]+")
 # so it is only used when someone drops latha.ttf / lathab.ttf into fonts/ (or it
 # is installed system-wide); otherwise we fall back to the bundled Noto Sans Tamil.
 _TAMIL_FACES = (
+    ("bamini.ttf", "baminib.ttf"),
     ("latha.ttf", "lathab.ttf"),
     ("NotoSansTamil-Regular.ttf", "NotoSansTamil-Bold.ttf"),
 )
+# Project-root fonts/ dir, so a TTF can be dropped in without digging into the
+# package: <repo>/fonts (exam_pdf.py lives at <repo>/Backend/app/pdf/).
+_PROJECT_FONT_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "fonts")
+)
 _FONT_SEARCH_DIRS = (
     _FONT_DIR,
+    _PROJECT_FONT_DIR,
     "/usr/share/fonts/truetype/msttcorefonts",
     "/usr/share/fonts/truetype/tamil",
     "/usr/local/share/fonts",
@@ -62,7 +69,10 @@ def _resolve_tamil_faces():
             continue
         # Latha ships without a separate bold on some systems; reuse the regular.
         return regular_path, _find_font_file(bold) or regular_path
-    raise FileNotFoundError("No Tamil font found; expected latha.ttf or NotoSansTamil-Regular.ttf")
+    raise FileNotFoundError(
+        "No Tamil font found; drop bamini.ttf, latha.ttf or NotoSansTamil-Regular.ttf "
+        f"into {_PROJECT_FONT_DIR} or {_FONT_DIR}"
+    )
 
 
 def _register_fonts():
