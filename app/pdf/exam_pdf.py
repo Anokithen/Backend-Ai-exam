@@ -8,10 +8,11 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.ttfonts import TTFont, TTFontFile
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
 from app.models.exam_model import QuestionType
+from app.pdf.bamini import unicode_to_bamini
 
 _LETTERS = string.ascii_uppercase
 
@@ -22,10 +23,13 @@ _FONT_DIR = os.path.join(os.path.dirname(__file__), "fonts")
 _FONT_TAMIL = "TamilScript"
 _FONT_TAMIL_BOLD = "TamilScript-Bold"
 _TAMIL_RUN = re.compile(r"[\u0b80-\u0bff]+")
+# Set by _register_fonts(): True when the resolved face is a legacy 8-bit font.
+_TAMIL_IS_LEGACY = False
 
-# Preferred first: Latha (Microsoft's Tamil UI font). It is not redistributable,
-# so it is only used when someone drops latha.ttf / lathab.ttf into fonts/ (or it
-# is installed system-wide); otherwise we fall back to the bundled Noto Sans Tamil.
+# Preferred first: Bamini, then Latha (Microsoft's Tamil UI font). Neither is
+# redistributable, so they are only used when someone drops the .ttf into fonts/
+# (or installs it system-wide); otherwise we fall back to Noto Sans Tamil.
+# Bamini is a legacy 8-bit font - see _TAMIL_IS_LEGACY below.
 _TAMIL_FACES = (
     ("bamini.ttf", "baminib.ttf"),
     ("latha.ttf", "lathab.ttf"),
@@ -75,10 +79,18 @@ def _resolve_tamil_faces():
     )
 
 
+def _is_legacy_face(path: str) -> bool:
+    """True for pre-Unicode fonts (Bamini): glyphs on ASCII, nothing in U+0B80-U+0BFF."""
+    cmap = TTFontFile(path).charToGlyph
+    return not any(code in cmap for code in range(0x0B80, 0x0C00))
+
+
 def _register_fonts():
+    global _TAMIL_IS_LEGACY
     if _FONT_TAMIL in pdfmetrics.getRegisteredFontNames():
         return
     regular_path, bold_path = _resolve_tamil_faces()
+    _TAMIL_IS_LEGACY = _is_legacy_face(regular_path)
     pdfmetrics.registerFont(TTFont(_FONT_TAMIL, regular_path))
     pdfmetrics.registerFont(TTFont(_FONT_TAMIL_BOLD, bold_path))
     pdfmetrics.registerFontFamily(
@@ -91,10 +103,28 @@ def _register_fonts():
 
 
 def _markup(text: str, bold: bool = False) -> str:
-    """Escape for ReportLab's mini-XML and wrap Tamil-script runs in the Tamil font."""
-    text = escape(text or "")
+    """Escape for ReportLab's mini-XML and wrap Tamil-script runs in the Tamil font.
+
+    For a legacy face the Tamil run is transliterated to Bamini's ASCII encoding
+    first. That output contains XML-significant bytes (``<`` draws ஈ, ``&`` draws
+    ரூ, ``>`` draws a comma), so each run is escaped *after* conversion rather than
+    escaping the whole string up front.
+    """
+    _register_fonts()
+    text = text or ""
     tamil_font = _FONT_TAMIL_BOLD if bold else _FONT_TAMIL
-    return _TAMIL_RUN.sub(lambda m: f'<font face="{tamil_font}">{m.group(0)}</font>', text)
+
+    parts = []
+    cursor = 0
+    for match in _TAMIL_RUN.finditer(text):
+        parts.append(escape(text[cursor : match.start()]))
+        run = match.group(0)
+        if _TAMIL_IS_LEGACY:
+            run = unicode_to_bamini(run)
+        parts.append(f'<font face="{tamil_font}">{escape(run)}</font>')
+        cursor = match.end()
+    parts.append(escape(text[cursor:]))
+    return "".join(parts)
 
 
 def build_exam_pdf(exam, include_answer_key: bool) -> io.BytesIO:
