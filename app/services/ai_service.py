@@ -15,15 +15,13 @@ from app.services.material_service import authenticated_download_url
 
 MIN_EXTRACTED_CHARS = 40
 
-TEXT_TIMEOUT_SECONDS = 120
-
-# Image calls are streamed, so this is a stall detector rather than a cap on the whole
-# response: the vision model reasons for minutes before its first token, but once it is
+# Every model call is streamed, so this is a stall detector rather than a cap on the whole
+# response: a reasoning model thinks for minutes before its first token, but once it is
 # working it should never go this long without sending anything.
-VISION_CONNECT_TIMEOUT_SECONDS = 30
-VISION_STALL_TIMEOUT_SECONDS = 300
+STREAM_CONNECT_TIMEOUT_SECONDS = 30
+STREAM_STALL_TIMEOUT_SECONDS = 300
 # Backstop so a model that dribbles chunks forever still ends the teacher's wait.
-VISION_TOTAL_TIMEOUT_SECONDS = 900
+STREAM_TOTAL_TIMEOUT_SECONDS = 900
 
 VISION_MAX_TOKENS = 4096
 
@@ -75,52 +73,22 @@ def _raise_for_nim_error(response) -> None:
     raise AIServiceUnavailable("The AI service rejected the request. Please try again.")
 
 
-def _post_nim(payload: dict, timeout: int, attempts: int = 2, api_key: str | None = None) -> dict:
-    """POST to the NIM chat endpoint, retrying transient failures (timeouts, 429s, 5xx).
-
-    ``api_key`` overrides the default text-model key (vision calls use their own).
-    """
-    config = current_app.config
-    url = f"{config['NVIDIA_NIM_BASE_URL']}/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key or config['NVIDIA_NIM_API_KEY']}"}
-
-    timed_out = False
-    for attempt in range(attempts):
-        is_last = attempt == attempts - 1
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
-        except (requests.Timeout, requests.ConnectionError) as exc:
-            timed_out = isinstance(exc, requests.Timeout)
-            if is_last:
-                break
-            time.sleep(2**attempt)
-            continue
-        except requests.RequestException as exc:
-            raise AIServiceUnavailable("Failed to reach the AI service. Please try again.") from exc
-
-        if response.status_code in _RETRYABLE_STATUS and not is_last:
-            time.sleep(_retry_delay(response, attempt))
-            continue
-
-        if not response.ok:
-            _raise_for_nim_error(response)
-
-        try:
-            return response.json()
-        except ValueError as exc:
-            raise AIServiceError("The AI service returned an unexpected response.") from exc
-
-    if timed_out:
-        raise AIServiceUnavailable("The AI service took too long to respond. Please try again.")
-    raise AIServiceUnavailable("Failed to reach the AI service. Please try again.")
-
-
-def _stream_nim(payload: dict, attempts: int = 2, api_key: str | None = None) -> str:
+def _stream_nim(
+    payload: dict,
+    attempts: int = 2,
+    api_key: str | None = None,
+    on_piece=None,
+    on_attempt=None,
+) -> str:
     """Stream a chat completion and return the assembled content.
 
     Reasoning models such as Kimi think for minutes before the first token and then write
     for minutes more. Streaming turns the read timeout into a "the model went quiet" check
     instead of a cap on how long a legitimate answer may take.
+
+    ``on_piece`` is handed each fragment of content as it arrives, so a caller can watch the
+    answer take shape. ``on_attempt`` fires as each attempt starts; a retry begins the answer
+    again from nothing, so anything counted from the earlier fragments must be discarded.
     """
     config = current_app.config
     url = f"{config['NVIDIA_NIM_BASE_URL']}/chat/completions"
@@ -129,20 +97,22 @@ def _stream_nim(payload: dict, attempts: int = 2, api_key: str | None = None) ->
 
     for attempt in range(attempts):
         is_last = attempt == attempts - 1
+        if on_attempt:
+            on_attempt()
         try:
             with requests.post(
                 url,
                 headers=headers,
                 json=body,
                 stream=True,
-                timeout=(VISION_CONNECT_TIMEOUT_SECONDS, VISION_STALL_TIMEOUT_SECONDS),
+                timeout=(STREAM_CONNECT_TIMEOUT_SECONDS, STREAM_STALL_TIMEOUT_SECONDS),
             ) as response:
                 if response.status_code in _RETRYABLE_STATUS and not is_last:
                     time.sleep(_retry_delay(response, attempt))
                     continue
                 if not response.ok:
                     _raise_for_nim_error(response)
-                return _collect_stream(response)
+                return _collect_stream(response, on_piece)
         except (requests.Timeout, requests.ConnectionError):
             if is_last:
                 raise AIServiceUnavailable(
@@ -155,14 +125,14 @@ def _stream_nim(payload: dict, attempts: int = 2, api_key: str | None = None) ->
     raise AIServiceUnavailable("Failed to reach the AI service. Please try again.")
 
 
-def _collect_stream(response) -> str:
+def _collect_stream(response, on_piece=None) -> str:
     started = time.monotonic()
     pieces = []
     # Decoded here rather than by requests: an SSE response carries no charset, so requests
     # would fall back to Latin-1 and turn every non-ASCII character — every Sinhala or Tamil
     # exam, and even an em dash — into mojibake.
     for raw in response.iter_lines():
-        if time.monotonic() - started > VISION_TOTAL_TIMEOUT_SECONDS:
+        if time.monotonic() - started > STREAM_TOTAL_TIMEOUT_SECONDS:
             raise AIServiceUnavailable("The AI service took too long to respond. Please try again.")
         if not raw:
             continue
@@ -184,6 +154,8 @@ def _collect_stream(response) -> str:
         piece = delta.get("content")
         if piece:
             pieces.append(piece)
+            if on_piece:
+                on_piece(piece)
 
     content = "".join(pieces).strip()
     if not content:
@@ -477,14 +449,94 @@ def _material_block(text: str) -> str:
     return f"Material:\n{text[:MAX_MATERIAL_CHARS]}{truncated_note}"
 
 
-def generate_questions(text: str, counts: dict, title_hint: str, language: str = "English") -> list[dict]:
+def generate_questions(
+    text: str,
+    counts: dict,
+    title_hint: str,
+    language: str = "English",
+    on_progress=None,
+) -> list[dict]:
+    """Write the exam, reporting each question as the model starts and finishes it.
+
+    ``on_progress`` receives ``{"created": n, "writing": m | None, "total": t}`` whenever the
+    count changes: ``created`` questions are complete, ``writing`` is the number of the one the
+    model is on right now (None between questions), ``total`` is how many were asked for.
+    """
     counts = _normalize_counts(counts)
     user_prompt = f"{_brief(counts, title_hint, language)}\n\n{_material_block(text)}"
     messages = [
         {"role": "system", "content": _SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
-    return _generate(messages, counts, _call_nvidia_nim)
+    progress = _QuestionProgress(sum(counts.values()), on_progress) if on_progress else None
+
+    def call(messages):
+        if progress is None:
+            return _call_nvidia_nim(messages)
+        return _call_nvidia_nim(messages, on_piece=progress.feed, on_attempt=progress.reset)
+
+    return _generate(messages, counts, call)
+
+
+class _QuestionProgress:
+    """Count the questions in the model's JSON while it is still being written.
+
+    The answer is one JSON document that is only parseable once it is complete, so the count
+    comes from watching the braces go by: every object that opens directly inside an array is
+    a question starting, and the matching close is that question finished. Braces inside
+    strings are skipped so a prompt like "Explain {x}" is not mistaken for structure, and
+    option lists hold only strings, so nothing else in the schema opens an object in an array.
+    """
+
+    def __init__(self, total: int, on_progress):
+        self.total = total
+        self.on_progress = on_progress
+        self._last = None
+        self.reset()
+
+    def reset(self):
+        self.started = 0
+        self.created = 0
+        self._stack: list[str] = []
+        self._in_string = False
+        self._escaped = False
+        self._report()
+
+    def feed(self, piece: str):
+        changed = False
+        for char in piece:
+            if self._in_string:
+                if self._escaped:
+                    self._escaped = False
+                elif char == "\\":
+                    self._escaped = True
+                elif char == '"':
+                    self._in_string = False
+                continue
+            if char == '"':
+                self._in_string = True
+            elif char in "{[":
+                if char == "{" and self._stack and self._stack[-1] == "[":
+                    self.started += 1
+                    changed = True
+                self._stack.append(char)
+            elif char in "}]":
+                if not self._stack:
+                    continue
+                opened = self._stack.pop()
+                if char == "}" and opened == "{" and self._stack and self._stack[-1] == "[":
+                    self.created += 1
+                    changed = True
+        if changed:
+            self._report()
+
+    def _report(self):
+        writing = self.started if self.started > self.created else None
+        state = (self.created, writing)
+        if state == self._last:
+            return
+        self._last = state
+        self.on_progress({"created": self.created, "writing": writing, "total": self.total})
 
 
 def _vision_models(language: str) -> list[str]:
@@ -514,7 +566,7 @@ def _generate(messages: list[dict], counts: dict, call, max_attempts: int = 3) -
             raw = call(messages)
             return _parse_questions(raw, counts)
         except AIServiceUnavailable:
-            # _post_nim already retried the transport; retrying here just multiplies the wait.
+            # _stream_nim already retried the transport; retrying here just multiplies the wait.
             raise
         except AIServiceError:
             if attempt == max_attempts - 1:
@@ -528,30 +580,17 @@ def _generate(messages: list[dict], counts: dict, call, max_attempts: int = 3) -
     raise AIServiceError("AI failed to generate valid questions.")
 
 
-def _message_content(data: dict) -> str:
-    try:
-        content = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise AIServiceError("The AI service returned an unexpected response.") from exc
-
-    # Reasoning models leave "content" null when they exhaust the budget mid-thought;
-    # surfacing it as an error lets the caller retry instead of parsing None.
-    if not content:
-        raise AIServiceError("The AI service returned an empty response.")
-    return content
-
-
-def _call_nvidia_nim(messages: list[dict]) -> str:
-    data = _post_nim(
+def _call_nvidia_nim(messages: list[dict], on_piece=None, on_attempt=None) -> str:
+    return _stream_nim(
         {
             "model": current_app.config["NVIDIA_NIM_MODEL"],
             "messages": messages,
             "temperature": 0.4,
             "max_tokens": 4096,
         },
-        timeout=TEXT_TIMEOUT_SECONDS,
+        on_piece=on_piece,
+        on_attempt=on_attempt,
     )
-    return _message_content(data)
 
 
 _OPTION_LETTERS = "ABCDEFGHIJ"

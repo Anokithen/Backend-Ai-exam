@@ -1,4 +1,6 @@
 import json
+import queue
+import threading
 
 from flask import Response, current_app, request, send_file, stream_with_context
 from flask_jwt_extended import get_current_user
@@ -90,6 +92,44 @@ def _prepare(teacher, payload):
     return context, None
 
 
+def _write_questions(context, text):
+    """Ask the model for the questions, yielding a progress event as each one is written.
+
+    The model call blocks for minutes, so it runs in a worker while this generator drains the
+    progress it reports; the finished list comes back as the generator's return value.
+    """
+    app = current_app._get_current_object()
+    updates: queue.Queue = queue.Queue()
+    finished = object()
+
+    def work():
+        # Flask's context is thread-local, so the worker pushes its own.
+        with app.app_context():
+            try:
+                questions = generate_questions(
+                    text,
+                    context["counts"],
+                    context["title"],
+                    context["language"],
+                    on_progress=updates.put,
+                )
+            except BaseException as exc:  # handed to the request thread to raise
+                updates.put((finished, None, exc))
+            else:
+                updates.put((finished, questions, None))
+
+    threading.Thread(target=work, daemon=True).start()
+
+    while True:
+        update = updates.get()
+        if isinstance(update, tuple) and update[0] is finished:
+            _, questions, exc = update
+            if exc is not None:
+                raise exc
+            return questions
+        yield {"type": "progress", "id": WRITE_STAGE, **update}
+
+
 def _run_generation(context):
     """Run the pipeline, yielding an event per stage as it starts and finishes.
 
@@ -161,9 +201,7 @@ def _run_generation(context):
 
     yield {"type": "stage", "id": WRITE_STAGE, "status": "running"}
     try:
-        questions_data = generate_questions(
-            combined, context["counts"], context["title"], context["language"]
-        )
+        questions_data = yield from _write_questions(context, combined)
     except AIServiceError as exc:
         yield {"type": "stage", "id": WRITE_STAGE, "status": "failed", "detail": str(exc)}
         yield {"type": "error", "code": "AI_GENERATION_FAILED", "message": str(exc)}
