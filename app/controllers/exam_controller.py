@@ -24,6 +24,10 @@ QUESTION_TYPES = {t.value for t in QuestionType}
 WRITE_STAGE = "write"
 SAVE_STAGE = "save"
 
+# A model can think for a minute or more before its first question, and a proxy that sees
+# nothing on the wire for that long closes the stream. A comment this often keeps it open.
+HEARTBEAT_SECONDS = 15
+
 
 def _get_owned_exam(teacher, public_id):
     return db.session.query(Exam).filter_by(public_id=public_id, teacher_id=teacher.id).first()
@@ -121,7 +125,11 @@ def _write_questions(context, text):
     threading.Thread(target=work, daemon=True).start()
 
     while True:
-        update = updates.get()
+        try:
+            update = updates.get(timeout=HEARTBEAT_SECONDS)
+        except queue.Empty:
+            yield {"type": "ping"}
+            continue
         if isinstance(update, tuple) and update[0] is finished:
             _, questions, exc = update
             if exc is not None:
@@ -292,6 +300,10 @@ def generate_exam_stream():
     def events():
         try:
             for event in _run_generation(context):
+                if event["type"] == "ping":
+                    # An SSE comment: keeps the connection alive, invisible to the client.
+                    yield ": ping\n\n"
+                    continue
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception:
             current_app.logger.exception("Exam generation stream failed")
