@@ -206,11 +206,17 @@ def _run_generation(context):
         yield {"type": "stage", "id": WRITE_STAGE, "status": "failed", "detail": str(exc)}
         yield {"type": "error", "code": "AI_GENERATION_FAILED", "message": str(exc)}
         return
+    requested = sum(int(context["counts"].get(t) or 0) for t in QUESTION_TYPES)
     yield {
         "type": "stage",
         "id": WRITE_STAGE,
         "status": "done",
-        "detail": f"{len(questions_data)} questions",
+        # Fewer than asked for means the material ran out of distinct facts for some type.
+        "detail": (
+            f"{len(questions_data)} questions"
+            if len(questions_data) >= requested
+            else f"{len(questions_data)} of {requested} questions - the material did not support more"
+        ),
     }
 
     yield {"type": "stage", "id": SAVE_STAGE, "status": "running"}

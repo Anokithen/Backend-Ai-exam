@@ -73,22 +73,12 @@ def _raise_for_nim_error(response) -> None:
     raise AIServiceUnavailable("The AI service rejected the request. Please try again.")
 
 
-def _stream_nim(
-    payload: dict,
-    attempts: int = 2,
-    api_key: str | None = None,
-    on_piece=None,
-    on_attempt=None,
-) -> str:
+def _stream_nim(payload: dict, attempts: int = 2, api_key: str | None = None) -> str:
     """Stream a chat completion and return the assembled content.
 
     Reasoning models such as Kimi think for minutes before the first token and then write
     for minutes more. Streaming turns the read timeout into a "the model went quiet" check
     instead of a cap on how long a legitimate answer may take.
-
-    ``on_piece`` is handed each fragment of content as it arrives, so a caller can watch the
-    answer take shape. ``on_attempt`` fires as each attempt starts; a retry begins the answer
-    again from nothing, so anything counted from the earlier fragments must be discarded.
     """
     config = current_app.config
     url = f"{config['NVIDIA_NIM_BASE_URL']}/chat/completions"
@@ -97,8 +87,6 @@ def _stream_nim(
 
     for attempt in range(attempts):
         is_last = attempt == attempts - 1
-        if on_attempt:
-            on_attempt()
         try:
             with requests.post(
                 url,
@@ -112,7 +100,7 @@ def _stream_nim(
                     continue
                 if not response.ok:
                     _raise_for_nim_error(response)
-                return _collect_stream(response, on_piece)
+                return _collect_stream(response)
         except (requests.Timeout, requests.ConnectionError):
             if is_last:
                 raise AIServiceUnavailable(
@@ -125,7 +113,7 @@ def _stream_nim(
     raise AIServiceUnavailable("Failed to reach the AI service. Please try again.")
 
 
-def _collect_stream(response, on_piece=None) -> str:
+def _collect_stream(response) -> str:
     started = time.monotonic()
     pieces = []
     # Decoded here rather than by requests: an SSE response carries no charset, so requests
@@ -154,8 +142,6 @@ def _collect_stream(response, on_piece=None) -> str:
         piece = delta.get("content")
         if piece:
             pieces.append(piece)
-            if on_piece:
-                on_piece(piece)
 
     content = "".join(pieces).strip()
     if not content:
@@ -370,60 +356,61 @@ def _extract_image_text(content: bytes, mime_type: str, language: str = "English
     raise AIServiceError("Failed to read text from the image. Please try again.")
 
 
-_SYSTEM_PROMPT = """You are an expert exam writer. Given study material and a requested \
-question breakdown, generate exam questions strictly as JSON.
+_SYSTEM_PROMPT = """You are an expert exam writer. You write ONE exam question at a time from \
+study material, strictly as JSON.
 
 Output ONLY a JSON object of this exact shape, no markdown, no commentary:
-{
-  "questions": [
-    {"type": "mcq", "prompt": "...", "options": ["...", "...", "...", "..."], "correct_option_index": 0, "marks": 1},
-    {"type": "structured", "prompt": "...", "marks": 5},
-    {"type": "essay", "prompt": "...", "marks": 10}
-  ]
-}
+- for an "mcq" question:
+  {"question": {"type": "mcq", "prompt": "...", "options": ["...", "...", "...", "..."], "correct_option_index": 0, "marks": 1}}
+- for a "structured" question:
+  {"question": {"type": "structured", "prompt": "...", "marks": 5}}
+- for an "essay" question:
+  {"question": {"type": "essay", "prompt": "...", "marks": 10}}
+- if the material has no remaining distinct fact that a question of the requested type could
+  test without repeating or fabricating:
+  {"question": null}
 
 Accuracy rules (most important):
-- Every question, option, and correct answer must be directly and verifiably supported by the
-  material below. Do not invent facts, names, dates, numbers, formulas, or details that are not
-  present in the material.
-- For "mcq" questions, the correct option must be explicitly stated or directly derivable from the
-  material, and the three incorrect options must be plausible but clearly wrong per the material —
-  never ambiguous or arguably also correct.
-- If the material does not contain enough distinct content to support the full requested count of
-  a question type without repeating or fabricating, generate fewer questions of that type rather
-  than inventing content. Never pad with generic or off-topic questions.
+- The question, its options, and its correct answer must be directly and verifiably supported
+  by the material below. Do not invent facts, names, dates, numbers, formulas, or details that
+  are not present in the material.
+- For an "mcq" question, the correct option must be explicitly stated or directly derivable
+  from the material, and the three incorrect options must be plausible but clearly wrong per
+  the material — never ambiguous or arguably also correct.
+- Never pad with a generic or off-topic question. Returning {"question": null} is always
+  better than inventing content.
 
 No repetition (just as important as accuracy):
-- Every question must test a DIFFERENT fact. No two questions may have the same correct answer or
-  check the same detail, in any question type.
-- Never re-ask a fact by rewording it. "What is X?", "X is made of what?", "Which of these is NOT
-  part of X?" and "X was discovered by whom?" all test the same fact — choose only ONE of them.
-- Before you write each new question, re-read the questions you have already written and confirm
-  the new one covers a fact that none of them touch.
-- Work through the whole material from beginning to end and spread the questions evenly across
-  every distinct topic in it. Do not ask several questions about one topic while ignoring others.
-- Returning FEWER questions than requested is always better than repeating a fact. If the material
-  only supports 6 distinct questions, return 6 and stop.
+- The questions already written for this exam are listed below. The new question must test a
+  DIFFERENT fact from every one of them: it may not share a correct answer with any of them or
+  check the same detail, whatever its type.
+- Never re-ask a fact by rewording it. "What is X?", "X is made of what?", "Which of these is
+  NOT part of X?" and "X was discovered by whom?" all test the same fact.
+- Pick the fact from a part of the material the earlier questions have not touched, working
+  through the material from beginning to end so the exam covers every distinct topic evenly.
+- If every distinct fact suitable for this question type is already tested, return
+  {"question": null} rather than repeating one.
 
 Other rules:
-- Produce the requested number of questions of each type, unless the accuracy or no-repetition
-  rules above require producing fewer.
-- "mcq" questions must have 4 "options" and a valid 0-based "correct_option_index".
-- "structured" and "essay" questions must NOT include "options" or "correct_option_index".
-- Vary marks sensibly: mcq typically 1-2, structured 4-8, essay 8-15.
-- Write every "prompt" and "options" value in the requested language below. Keep the JSON keys
-  ("type", "prompt", "options", "correct_option_index", "marks") in English exactly as shown.
+- Write exactly the question type requested.
+- An "mcq" question must have 4 "options" and a valid 0-based "correct_option_index".
+- A "structured" or "essay" question must NOT include "options" or "correct_option_index".
+- Set marks sensibly: mcq typically 1-2, structured 4-8, essay 8-15.
+- Write the "prompt" and "options" values in the requested language below. Keep the JSON keys
+  ("question", "type", "prompt", "options", "correct_option_index", "marks") in English
+  exactly as shown.
 """
 
 
 MAX_MATERIAL_CHARS = 24000
 
 _RETRY_NUDGE = (
-    "That response was empty or not valid JSON matching the schema. If the material "
-    "has ANY content relevant to the requested topics, generate at least a few valid "
-    "questions from it — only return an empty list if the material truly has no "
-    "usable content at all. Respond with JSON only."
+    "{problem} Respond with JSON only: one \"{qtype}\" question that tests a fact none of the "
+    "already-written questions test, or {{\"question\": null}} if the material has none left."
 )
+
+# The order the paper reads in: quick recall first, then longer answers.
+_TYPE_ORDER = ("mcq", "structured", "essay")
 
 
 def _normalize_counts(counts: dict) -> dict:
@@ -433,20 +420,31 @@ def _normalize_counts(counts: dict) -> dict:
     return counts
 
 
-def _brief(counts: dict, title_hint: str, language: str) -> str:
-    requested = ", ".join(f"{count} {qtype}" for qtype, count in counts.items())
-    return (
-        f"Material title: {title_hint}\n\n"
-        f"Requested questions: {requested}\n\n"
-        f"Write the exam in this language: {language}"
-    )
-
-
 def _material_block(text: str) -> str:
     truncated_note = (
         "\n\n[material truncated for length]" if len(text) > MAX_MATERIAL_CHARS else ""
     )
     return f"Material:\n{text[:MAX_MATERIAL_CHARS]}{truncated_note}"
+
+
+def _written_block(written: list[dict]) -> str:
+    """The questions so far, with their answers, so the model can see which facts are taken."""
+    if not written:
+        return "Already written questions: none yet."
+    lines = ["Already written questions (the new question must not test any fact these test):"]
+    for number, q in enumerate(written, 1):
+        lines.append(f"{number}. [{q['type']}] {q['prompt']}")
+        if q["type"] == "mcq":
+            lines.append(f"   correct answer: {q['options'][q['correct_option_index']]}")
+    return "\n".join(lines)
+
+
+def _brief(qtype: str, number: int, total: int, title_hint: str, language: str) -> str:
+    return (
+        f"Material title: {title_hint}\n\n"
+        f"Write question {number} of {total}: one \"{qtype}\" question.\n\n"
+        f"Write it in this language: {language}"
+    )
 
 
 def generate_questions(
@@ -456,87 +454,73 @@ def generate_questions(
     language: str = "English",
     on_progress=None,
 ) -> list[dict]:
-    """Write the exam, reporting each question as the model starts and finishes it.
+    """Write the exam one question at a time, reporting each as it is finished.
 
-    ``on_progress`` receives ``{"created": n, "writing": m | None, "total": t}`` whenever the
-    count changes: ``created`` questions are complete, ``writing`` is the number of the one the
-    model is on right now (None between questions), ``total`` is how many were asked for.
+    Each question is its own model call that is shown everything written so far, so the exam
+    grows in front of the teacher and no two questions test the same fact. ``on_progress``
+    receives ``{"created": n, "writing": m | None, "writing_type": type, "total": t}`` as each
+    question starts, and the same plus ``"question": {...}`` as each one lands.
+
+    A question the model cannot produce is skipped rather than failing the exam: if it says
+    the material has no more distinct facts for a type, the rest of that type is dropped, and
+    if the service drops out part-way the questions already written are kept.
     """
     counts = _normalize_counts(counts)
-    user_prompt = f"{_brief(counts, title_hint, language)}\n\n{_material_block(text)}"
-    messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
-    progress = _QuestionProgress(sum(counts.values()), on_progress) if on_progress else None
+    order = [qtype for qtype in _TYPE_ORDER for _ in range(int(counts.get(qtype) or 0))]
+    total = len(order)
+    report = on_progress or (lambda event: None)
+    material = _material_block(text)
 
-    def call(messages):
-        if progress is None:
-            return _call_nvidia_nim(messages)
-        return _call_nvidia_nim(messages, on_piece=progress.feed, on_attempt=progress.reset)
+    written: list[dict] = []
+    seen_prompts: set[str] = set()
+    exhausted: set[str] = set()
 
-    return _generate(messages, counts, call)
+    for qtype in order:
+        if qtype in exhausted:
+            continue
+        number = len(written) + 1
+        report({"created": len(written), "writing": number, "writing_type": qtype, "total": total})
 
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"{_brief(qtype, number, total, title_hint, language)}\n\n"
+                    f"{_written_block(written)}\n\n{material}"
+                ),
+            },
+        ]
+        try:
+            question = _generate(
+                messages,
+                lambda raw: _parse_one_question(raw, qtype, seen_prompts),
+                _call_nvidia_nim,
+                nudge=lambda problem: _RETRY_NUDGE.format(problem=problem, qtype=qtype),
+            )
+        except AIServiceUnavailable:
+            if not written:
+                raise
+            current_app.logger.warning("AI service dropped out after %d questions; keeping them", len(written))
+            break
+        except AIServiceError as exc:
+            current_app.logger.warning("Skipping %s question %d: %s", qtype, number, exc)
+            continue
 
-class _QuestionProgress:
-    """Count the questions in the model's JSON while it is still being written.
+        if question is None:
+            current_app.logger.info("Material exhausted for %s questions after %d written", qtype, len(written))
+            exhausted.add(qtype)
+            continue
 
-    The answer is one JSON document that is only parseable once it is complete, so the count
-    comes from watching the braces go by: every object that opens directly inside an array is
-    a question starting, and the matching close is that question finished. Braces inside
-    strings are skipped so a prompt like "Explain {x}" is not mistaken for structure, and
-    option lists hold only strings, so nothing else in the schema opens an object in an array.
-    """
+        written.append(question)
+        seen_prompts.add(_dedupe_key(question["prompt"]))
+        report({"created": len(written), "writing": None, "total": total, "question": question})
 
-    def __init__(self, total: int, on_progress):
-        self.total = total
-        self.on_progress = on_progress
-        self._last = None
-        self.reset()
-
-    def reset(self):
-        self.started = 0
-        self.created = 0
-        self._stack: list[str] = []
-        self._in_string = False
-        self._escaped = False
-        self._report()
-
-    def feed(self, piece: str):
-        changed = False
-        for char in piece:
-            if self._in_string:
-                if self._escaped:
-                    self._escaped = False
-                elif char == "\\":
-                    self._escaped = True
-                elif char == '"':
-                    self._in_string = False
-                continue
-            if char == '"':
-                self._in_string = True
-            elif char in "{[":
-                if char == "{" and self._stack and self._stack[-1] == "[":
-                    self.started += 1
-                    changed = True
-                self._stack.append(char)
-            elif char in "}]":
-                if not self._stack:
-                    continue
-                opened = self._stack.pop()
-                if char == "}" and opened == "{" and self._stack and self._stack[-1] == "[":
-                    self.created += 1
-                    changed = True
-        if changed:
-            self._report()
-
-    def _report(self):
-        writing = self.started if self.started > self.created else None
-        state = (self.created, writing)
-        if state == self._last:
-            return
-        self._last = state
-        self.on_progress({"created": self.created, "writing": writing, "total": self.total})
+    if not written:
+        raise AIServiceError("AI did not return any usable questions.")
+    # Settles the display when the last slot was skipped rather than written.
+    report({"created": len(written), "writing": None, "total": total})
+    return written
 
 
 def _vision_models(language: str) -> list[str]:
@@ -559,37 +543,36 @@ def _vision_models(language: str) -> list[str]:
     return list(dict.fromkeys(model for model in chain if model))
 
 
-def _generate(messages: list[dict], counts: dict, call, max_attempts: int = 3) -> list[dict]:
+def _generate(messages: list[dict], parse, call, nudge, max_attempts: int = 3):
+    """Call the model until ``parse`` accepts its answer, telling it what was wrong each time."""
     for attempt in range(max_attempts):
         raw = None
         try:
             raw = call(messages)
-            return _parse_questions(raw, counts)
+            return parse(raw)
         except AIServiceUnavailable:
             # _stream_nim already retried the transport; retrying here just multiplies the wait.
             raise
-        except AIServiceError:
+        except AIServiceError as exc:
             if attempt == max_attempts - 1:
                 raise
             if raw is not None:
                 messages = messages + [
                     {"role": "assistant", "content": raw},
-                    {"role": "user", "content": _RETRY_NUDGE},
+                    {"role": "user", "content": nudge(str(exc))},
                 ]
 
-    raise AIServiceError("AI failed to generate valid questions.")
+    raise AIServiceError("AI failed to generate a valid question.")
 
 
-def _call_nvidia_nim(messages: list[dict], on_piece=None, on_attempt=None) -> str:
+def _call_nvidia_nim(messages: list[dict]) -> str:
     return _stream_nim(
         {
             "model": current_app.config["NVIDIA_NIM_MODEL"],
             "messages": messages,
             "temperature": 0.4,
             "max_tokens": 4096,
-        },
-        on_piece=on_piece,
-        on_attempt=on_attempt,
+        }
     )
 
 
@@ -668,67 +651,69 @@ def _dedupe_key(prompt: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", prompt.casefold())).strip()
 
 
-def _extract_question_list(payload):
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        if isinstance(payload.get("questions"), list):
-            return payload["questions"]
-        if "type" in payload and "prompt" in payload:
-            return [payload]
-    return None
-
-
-def _parse_questions(raw: str, counts: dict) -> list[dict]:
+def _load_json(raw: str):
     cleaned = re.sub(r"^```(json)?|```$", "", (raw or "").strip(), flags=re.MULTILINE).strip()
     try:
-        payload = json.loads(cleaned)
+        return json.loads(cleaned)
     except json.JSONDecodeError as exc:
         raise AIServiceError("AI response was not valid JSON.") from exc
 
-    questions = _extract_question_list(payload)
-    if questions is None:
-        raise AIServiceError("AI response did not contain a list of questions.")
 
-    normalized = []
-    seen_prompts = set()
-    for q in questions:
-        if not isinstance(q, dict):
-            continue
-        qtype = _coerce_type(q.get("type"))
-        if qtype is None:
-            continue
-        prompt = str(q.get("prompt") or "").strip()
-        if not prompt:
-            continue
-        key = _dedupe_key(prompt)
-        if key in seen_prompts:
-            continue
+def _normalize_question(q) -> dict | None:
+    """Coerce one question object into the stored shape, or None if it is unusable."""
+    if not isinstance(q, dict):
+        return None
+    qtype = _coerce_type(q.get("type"))
+    if qtype is None:
+        return None
+    prompt = str(q.get("prompt") or "").strip()
+    if not prompt:
+        return None
 
-        item = {"type": qtype, "prompt": prompt, "marks": _coerce_marks(q.get("marks"), qtype)}
-        if qtype == "mcq":
-            options = q.get("options") or []
-            if not isinstance(options, list) or len(options) < 2:
-                continue
-            answer = q.get("correct_option_index")
-            if answer is None:
-                answer = q.get("correct_answer", q.get("answer"))
-            correct = _coerce_option_index(answer, options)
-            if correct is None or not (0 <= correct < len(options)):
-                continue
-            if len(options) > 4:
-                # Keep exactly 4 options; make sure the correct one survives the trim.
-                correct_option = options[correct]
-                others = [opt for i, opt in enumerate(options) if i != correct][:3]
-                options = others + [correct_option]
-                correct = len(options) - 1
-            item["options"] = [str(opt) for opt in options]
-            item["correct_option_index"] = correct
-        seen_prompts.add(key)
-        normalized.append(item)
+    item = {"type": qtype, "prompt": prompt, "marks": _coerce_marks(q.get("marks"), qtype)}
+    if qtype == "mcq":
+        options = q.get("options") or []
+        if not isinstance(options, list) or len(options) < 2:
+            return None
+        answer = q.get("correct_option_index")
+        if answer is None:
+            answer = q.get("correct_answer", q.get("answer"))
+        correct = _coerce_option_index(answer, options)
+        if correct is None or not (0 <= correct < len(options)):
+            return None
+        if len(options) > 4:
+            # Keep exactly 4 options; make sure the correct one survives the trim.
+            correct_option = options[correct]
+            others = [opt for i, opt in enumerate(options) if i != correct][:3]
+            options = others + [correct_option]
+            correct = len(options) - 1
+        item["options"] = [str(opt) for opt in options]
+        item["correct_option_index"] = correct
+    return item
 
-    if not normalized:
-        if questions:
-            raise AIServiceError("AI returned questions in an unexpected format.")
-        raise AIServiceError("AI did not return any usable questions.")
-    return normalized
+
+def _parse_one_question(raw: str, qtype: str, seen_prompts: set[str]) -> dict | None:
+    """Read the model's single question; None means it said the material has none left.
+
+    Anything else the model might do wrong - the wrong type, a repeat of an earlier question,
+    a malformed object - raises with a message the retry can put back to it.
+    """
+    payload = _load_json(raw)
+    if isinstance(payload, dict) and "question" in payload:
+        payload = payload["question"]
+    if payload is None:
+        return None
+    # A model that ignores the wrapper and sends a list is forgiven if the list holds one.
+    if isinstance(payload, list):
+        payload = payload[0] if len(payload) == 1 else None
+    if not isinstance(payload, dict):
+        raise AIServiceError("AI response did not contain a question object.")
+
+    question = _normalize_question(payload)
+    if question is None:
+        raise AIServiceError("AI returned a question in an unexpected format.")
+    if question["type"] != qtype:
+        raise AIServiceError(f"AI returned a {question['type']} question instead of {qtype}.")
+    if _dedupe_key(question["prompt"]) in seen_prompts:
+        raise AIServiceError("That question repeats one already written.")
+    return question
